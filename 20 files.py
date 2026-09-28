@@ -116,6 +116,58 @@ test_df = pd.DataFrame([
 
 display(test_df)
 
+with open(audio_path, "rb") as audio:
+
+    response = requests.post(
+        AZURE_TRANSCRIBE_ENDPOINT,
+        headers=headers,
+
+        files={
+            "file": (
+                audio_file,
+                audio,
+                "audio/mpeg"
+            )
+        },
+
+        data={
+            "response_format": "diarized_json",
+            "language": "en",
+            "chunking_strategy": "auto",
+
+            "prompt": """
+You are transcribing a customer service call.
+
+Identify the conversational role of each speaker when possible.
+
+Use only these speaker roles:
+- IVR
+- CUSTOMER
+- CSR
+
+IVR = automated telephone system messages.
+CUSTOMER = person calling for service.
+CSR = human customer service representative.
+
+When producing the diarized transcript, use the semantic role
+(CUSTOMER, CSR, or IVR) instead of generic speaker IDs whenever
+the role can be determined reliably.
+"""
+        },
+
+        timeout=1800
+    )
+
+
+result = response.json()
+
+for segment in result.get("segments", []):
+    print(
+        segment.get("speaker"),
+        ":",
+        segment.get("text", "").strip()
+    )
+
 
 
 
