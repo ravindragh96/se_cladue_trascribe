@@ -2,6 +2,138 @@ import os
 import requests
 import pandas as pd
 from azure.identity import DefaultAzureCredential
+
+
+# ============================================================
+# AZURE TRANSCRIPTION ENDPOINT
+# ============================================================
+
+AZURE_TRANSCRIBE_ENDPOINT = (
+    "https://service-experts-demo-resource.openai.azure.com"
+    "/openai/deployments/gpt-4o-transcribe-diarize-2"
+    "/audio/transcriptions"
+    "?api-version=2025-03-01-preview"
+)
+
+
+# ============================================================
+# LOCAL AUDIO FOLDER
+# ============================================================
+
+AUDIO_FOLDER = r"C:\Users\YourName\Downloads\audio_sample_20"
+
+
+audio_files = sorted([
+    os.path.join(AUDIO_FOLDER, f)
+    for f in os.listdir(AUDIO_FOLDER)
+    if f.lower().endswith(".mp3")
+])
+
+
+print("MP3 files found:", len(audio_files))
+
+for f in audio_files:
+    print(os.path.basename(f))
+
+
+AUDIO_FOLDER = r"C:\Users\YourName\Downloads\audio_sample_20"
+credential = DefaultAzureCredential()
+
+token = credential.get_token(
+    "https://cognitiveservices.azure.com/.default"
+).token
+
+headers = {
+    "Authorization": f"Bearer {token}"
+}
+
+print("Authentication successful")
+
+audio_path = audio_files[0]
+
+audio_file = os.path.basename(audio_path)
+audio_id = os.path.splitext(audio_file)[0]
+
+print("Testing file:")
+print(audio_file)
+
+with open(audio_path, "rb") as audio:
+
+    response = requests.post(
+        AZURE_TRANSCRIBE_ENDPOINT,
+        headers=headers,
+
+        files={
+            "file": (
+                audio_file,
+                audio,
+                "audio/mpeg"
+            )
+        },
+
+        data={
+            "response_format": "diarized_json",
+            "language": "en",
+            "chunking_strategy": "auto"
+        },
+
+        timeout=1800
+    )
+
+
+print("HTTP Status:", response.status_code)
+
+if response.status_code != 200:
+    print(response.text)
+else:
+    print("Transcription successful")
+
+
+result = response.json()
+
+transcript_lines = []
+
+for segment in result.get("segments", []):
+
+    speaker = segment.get("speaker", "").strip()
+    text = segment.get("text", "").strip()
+
+    if text:
+        transcript_lines.append(
+            f"{speaker}: {text}"
+        )
+
+transcript = "\n".join(transcript_lines)
+
+print(transcript)
+test_df = pd.DataFrame([
+    {
+        "audio_id": audio_id,
+        "audio_file": audio_file,
+        "transcript": transcript
+    }
+])
+
+display(test_df)
+
+
+
+
+
+
+
+
+
+
+
+
+
+######################################################################################
+
+import os
+import requests
+import pandas as pd
+from azure.identity import DefaultAzureCredential
 AZURE_TRANSCRIBE_ENDPOINT = (
     "https://service-experts-demo-resource.openai.azure.com"
     "/openai/deployments/gpt-4o-transcribe-diarize-2"
