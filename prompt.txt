@@ -1,3 +1,49 @@
+input given by client 
+
+SYSTEM:
+You are analyzing a transcript of an inbound phone call to a residential
+HVAC/plumbing/electrical home-services company. Extract structured facts,
+then classify. Base every answer ONLY on transcript content. If the
+transcript does not contain evidence for a field, use "none"/"unclear" —
+do not guess. Output valid JSON matching the schema exactly, no prose.
+⁠
+DEFINITIONS:
+- REVENUE OPPORTUNITY: the caller expresses a service need that could
+  result in billable work (repair, install, maintenance, estimate),
+  regardless of whether an appointment was booked on this call.
+  NOT revenue opportunities: billing/payment questions, technician-ETA
+  status checks, calls about rescheduling an existing appointment with
+  no new need, solicitations, wrong numbers, employment inquiries.
+- BOOKED ON CALL: the customer and agent verbally agreed to an
+  appointment or next service step during this call. A customer saying
+  "yes, let's do it" with no date settled = "committed_no_time".
+⁠
+SCHEMA:
+{
+  "trade": "hvac|plumbing|electrical|multiple|none",
+  "service_category": "repair|replacement_install|maintenance|estimate_quote|diagnostic|none",
+  "urgency": "emergency|prompt|flexible|none",
+  "caller_relationship": "claims_new|claims_existing_or_member|unclear",
+  "call_regarding": "new_service_need|existing_job_or_appt|billing_admin|other",
+  "agent_offered_booking": true|false,
+  "booked_on_call": "booked|committed_no_time|declined|not_discussed|transferred|call_dropped",
+  "refusal_reason": "price|scheduling|competitor|quotes_only|service_area|not_accepting|other|na",
+  "refusal_paraphrase": "<one sentence or null>",
+  "evidence": { "<field>": "<short verbatim quote>", ... },
+  "summary": "<2 sentences: who called, what they wanted, how it ended>",
+  "revenue_opportunity": true|false,
+  "intent_strength": 1-5,
+  "confidence": "high|medium|low"
+}
+⁠
+INTENT ANCHORS:
+5 = urgent need, ready to book now
+4 = clear need, willing to book, minor friction (schedule/price question)
+3 = real need, actively shopping or flexible timing
+2 = exploratory, gathering information, no commitment signals
+1 = vague or hypothetical interest
+
+
 class PromptManager:
     """
     Builds prompts for the Revenue Opportunity Detection model.
