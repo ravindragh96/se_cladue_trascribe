@@ -1,0 +1,262 @@
+"""
+==============================================================================
+Track A - Service Experts Revenue Opportunity Detection
+
+LLM Client
+
+Responsibilities
+----------------
+1. Build chat messages
+2. Call ModelRegistry
+3. Normalize Databricks Foundation Model responses
+4. Return clean text
+
+Business logic is NOT handled here.
+
+Author
+------
+Ravindra Gantasala
+==============================================================================
+"""
+
+import logging
+import re
+from typing import Dict, List, Optional
+
+from models.model_registry import ModelRegistry
+
+logger = logging.getLogger(__name__)
+
+
+class LLMClient:
+    """
+    Centralized client for all LLM inference.
+
+    Every downstream module should call ONLY this class.
+    """
+
+    def __init__(
+        self,
+        registry: ModelRegistry,
+        endpoint_name: Optional[str] = None
+    ):
+
+        self.registry = registry
+        self.endpoint_name = endpoint_name
+
+        logger.info("LLM Client initialized.")
+
+    # ------------------------------------------------------------------
+    # Build Messages
+    # ------------------------------------------------------------------
+
+    def _build_messages(
+        self,
+        system_prompt: str,
+        user_prompt: str
+    ) -> List[Dict]:
+
+        return [
+            {
+                "role": "system",
+                "content": system_prompt.strip()
+            },
+            {
+                "role": "user",
+                "content": user_prompt.strip()
+            }
+        ]
+
+    # ------------------------------------------------------------------
+    # Public Generate
+    # ------------------------------------------------------------------
+
+    def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+        max_tokens: int = 1500
+    ) -> str:
+
+        messages = self._build_messages(
+            system_prompt,
+            user_prompt
+        )
+
+        raw_response = self.registry.predict_llm(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            endpoint_name=self.endpoint_name
+        )
+
+        return self._extract_text(raw_response)
+
+    # ------------------------------------------------------------------
+    # Databricks Response Parser
+    # ------------------------------------------------------------------
+
+    def _extract_text(self, response) -> str:
+        """
+        Normalizes every Databricks response shape.
+
+        Supported
+
+        Chat Endpoint
+
+        {
+            "choices":[
+                {
+                    "message":{
+                        "content":"..."
+                    }
+                }
+            ]
+        }
+
+        Foundation Models
+
+        {
+            "predictions":[
+                {
+                    "content":"..."
+                }
+            ]
+        }
+
+        {
+            "predictions":[
+                {
+                    "text":"..."
+                }
+            ]
+        }
+
+        Legacy
+
+        {
+            "predictions":[ "..."]
+        }
+        """
+
+        # The model output may repeat PII from the call. Never log it verbatim.
+        logger.debug("LLM response received, type=%s", type(response).__name__)
+
+        text = None
+
+        try:
+
+            # ----------------------------------------------------------
+            # OpenAI Chat schema
+            # ----------------------------------------------------------
+
+            if isinstance(response, dict):
+
+                choices = response.get("choices")
+
+                if choices:
+
+                    message = choices[0].get("message", {})
+
+                    text = message.get("content")
+
+                # ------------------------------------------------------
+                # Databricks Foundation Model schema
+                # ------------------------------------------------------
+
+                if text is None:
+
+                    predictions = response.get("predictions")
+
+                    if predictions:
+
+                        first = predictions[0]
+
+                        if isinstance(first, dict):
+
+                            text = (
+                                first.get("content")
+                                or first.get("text")
+                                or first.get("generated_text")
+                            )
+
+                        elif isinstance(first, str):
+
+                            text = first
+
+                # ------------------------------------------------------
+                # Direct Content
+                # ------------------------------------------------------
+
+                if text is None:
+
+                    text = (
+                        response.get("content")
+                        or response.get("text")
+                    )
+
+            elif isinstance(response, str):
+
+                text = response
+
+            else:
+
+                text = str(response)
+
+        except Exception:
+
+            logger.exception("Unable to parse model response.")
+
+            text = str(response)
+
+        if text is None:
+            text = ""
+
+        return self._clean_response(text)
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def _clean_response(
+        self,
+        text: str
+    ) -> str:
+
+        if not text:
+            return ""
+
+        if isinstance(text, list):
+            text = "\n".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in text
+            )
+
+        text = text.strip()
+
+        text = re.sub(
+            r"^```json",
+            "",
+            text,
+            flags=re.IGNORECASE
+        )
+
+        text = re.sub(
+            r"^```",
+            "",
+            text
+        )
+
+        text = re.sub(
+            r"```$",
+            "",
+            text
+        )
+
+        # Remove complete reasoning/thinking blocks, not only their markers.
+        # A leftover reasoning narrative would otherwise make JSON parsing fail.
+        text = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", text,
+                      flags=re.DOTALL | re.IGNORECASE)
+
+        return text.strip()
