@@ -1,846 +1,129 @@
-"""
-==============================================================================
-Track A - Revenue Opportunity Detection
-
-Detector Module
-
-Responsibilities
-----------------
-1. Build prompts
-2. Call LLMClient
-3. Parse JSON
-4. Validate output
-5. Apply business rules
-6. Return standardized business response
-
-This module contains NO Databricks-specific logic.
-
-Author:
-    Ravindra Gantasala
-==============================================================================
-"""
-
+"""Service Experts 14-field client-contract detector with grounded evidence repair."""
 import json
 import logging
 import re
-from copy import deepcopy
-from typing import Any, Dict, List
-
-from modules.llm_client import LLMClient
+from pathlib import Path
+from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
-VALID_TRADES = {
-    "hvac",
-    "plumbing",
-    "electrical",
-    "none"
+ENUMS = {
+    'trade': {'hvac','plumbing','electrical','multiple','none'},
+    'service_category': {'repair','replacement_install','maintenance','estimate_quote','diagnostic','none'},
+    'urgency': {'emergency','prompt','flexible','none'},
+    'caller_relationship': {'claims_new','claims_existing_or_member','unclear'},
+    'call_regarding': {'new_service_need','existing_job_or_appt','billing_admin','other'},
+    'booked_on_call': {'booked','committed_no_time','declined','not_discussed','transferred','call_dropped'},
+    'refusal_reason': {'price','scheduling','competitor','quotes_only','service_area','not_accepting','other','na'},
+    'confidence': {'high','medium','low'},
+}
+DEFAULTS = {
+    'trade':'none','service_category':'none','urgency':'none',
+    'caller_relationship':'unclear','call_regarding':'other',
+    'agent_offered_booking':False,'booked_on_call':'not_discussed',
+    'refusal_reason':'na','refusal_paraphrase':None,'evidence':{},
+    'summary':'The caller\'s request is unclear. The call outcome cannot be established.',
+    'revenue_opportunity':False,'intent_strength':1,'confidence':'low'
 }
 
-VALID_SERVICE_CATEGORIES = {
-    "repair",
-    "maintenance",
-    "installation",
-    "inspection",
-    "replacement",
-    "tune-up",
-    "iaq",
-    "drain",
-    "water heater",
-    "none"
-}
-
-VALID_URGENCY = {
-    "emergency",
-    "urgent",
-    "same_day",
-    "prompt",
-    "routine",
-    "none"
-}
-
-VALID_APPOINTMENT_STATUS = {
-    "requested",
-    "scheduled",
-    "not_requested",
-    "not_scheduled",
-    "transferred",
-    "unknown"
-}
-
-VALID_CONFIDENCE = {
-    "high",
-    "medium",
-    "low"
-}
-
-DEFAULT_RESPONSE = {
-    "core_intent": "",
-    "customer_problem": "",
-    "customer_goal": "",
-    "requested_service": "",
-    "trade": "none",
-    "service_category": "none",
-    "urgency": "none",
-    "appointment_status": "not_scheduled",
-    "pricing_discussed": False,
-    "revenue_opportunity": False,
-    "intent_strength": 1,
-    "confidence": "low",
-    "confidence_score": 0,
-    "evidence": [],
-    "business_summary": "",
-    "business_reason": ""
-}
-
-
-def default_response() -> Dict[str, Any]:
-    """
-    Returns a deep copy of default response.
-    """
-    return deepcopy(DEFAULT_RESPONSE)
-
-# ==============================================================================
-# Prompt Manager
-# ==============================================================================
+class DetectorError(ValueError):
+    pass
 
 class PromptManager:
-    """
-    Builds prompts for the Revenue Opportunity Detection model.
-    """
+    @staticmethod
+    def system_prompt():
+        return Path(__file__).resolve().with_name('prompt.txt').read_text(encoding='utf-8-sig').strip()
 
     @staticmethod
-    def system_prompt() -> str:
-        from pathlib import Path
-        path = Path(__file__).resolve().with_name("prompt.txt")
-        return path.read_text(encoding="utf-8-sig").strip()
-
-    @staticmethod
-    def user_prompt(transcript: str) -> str:
-
-        transcript = transcript.strip()
-
-        return f"""
-Analyze the following customer service transcript according to the
-revenue opportunity classification rules provided in the system prompt.
-
-Determine the customer's PRIMARY intent and whether the customer expressed
-a NEW or POTENTIAL revenue opportunity.
-
-Pay particular attention to whether the customer is discussing an EXISTING
-appointment/job versus requesting a NEW or ADDITIONAL service.
-
-Transcript:
-
-----------
-{transcript}
-----------
-
-Return ONLY the JSON object.
-"""
-    
-# ==============================================================================
-# JSON Parser
-# ==============================================================================
+    def user_prompt(transcript):
+        return ('Analyze the following transcript using the system instructions. '
+                'Return exactly the 14 required JSON keys. Evidence values must be '
+                'exact substrings of this transcript; summary must be exactly two sentences.\n'
+                '<transcript>\n'+transcript+'\n</transcript>')
 
 class JsonParser:
-    """
-    Handles extraction and parsing of JSON returned by the LLM.
-    """
-
     @staticmethod
-    def clean_response(response: str) -> str:
-        """
-        Removes markdown wrappers and unwanted tags.
-        """
-
-        if not response:
-            return ""
-
-        response = response.strip()
-
-        response = re.sub(
-            r"^```json",
-            "",
-            response,
-            flags=re.IGNORECASE
-        )
-
-        response = re.sub(
-            r"^```",
-            "",
-            response
-        )
-
-        response = re.sub(
-            r"```$",
-            "",
-            response
-        )
-
-        response = response.replace("<think>", "")
-        response = response.replace("</think>", "")
-
-        return response.strip()
-
-    @staticmethod
-    def extract_json(text: str) -> str:
-        """
-        Extract the first valid JSON object from text.
-        """
-
-        if not text:
-            raise ValueError("Empty model response.")
-
-        text = JsonParser.clean_response(text)
-
-        start = text.find("{")
-
-        if start == -1:
-            raise ValueError("JSON start '{' not found.")
-
-        brace_count = 0
-
-        for index in range(start, len(text)):
-
-            if text[index] == "{":
-                brace_count += 1
-
-            elif text[index] == "}":
-                brace_count -= 1
-
-                if brace_count == 0:
-                    return text[start:index + 1]
-
-        raise ValueError("Incomplete JSON object.")
-
-    @staticmethod
-    def parse(text: str) -> Dict[str, Any]:
-        """
-        Returns parsed JSON dictionary.
-        """
-
-        json_text = JsonParser.extract_json(text)
-
-        try:
-            return json.loads(json_text)
-
-        except json.JSONDecodeError as e:
-
-            logger.exception("JSON decoding failed.")
-
-            raise ValueError(
-                f"Invalid JSON returned by model: {e}"
-            )
-
-    @staticmethod
-    def safe_parse(text: str) -> Dict[str, Any]:
-        """
-        Safe JSON parser.
-        Returns default response on failure.
-        """
-
-        try:
-
-            return JsonParser.parse(text)
-
-        except Exception as e:
-
-            logger.exception(e)
-
-            result = default_response()
-
-            result["business_reason"] = (
-                f"JSON parsing failed : {str(e)}"
-            )
-
-            return result
-        
-
-# ==============================================================================
-# Validator
-# ==============================================================================
+    def parse(response):
+        if not isinstance(response,str):
+            raise DetectorError('LLM response is not text')
+        response = re.sub(r'<think\b[^>]*>.*?</think\s*>','',response,flags=re.S|re.I)
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r'\{',response):
+            try:
+                obj,_ = decoder.raw_decode(response[match.start():])
+                if isinstance(obj,dict):
+                    return obj
+            except json.JSONDecodeError:
+                pass
+        raise DetectorError('No valid JSON object in model response')
 
 class Validator:
-    """
-    Validates and normalizes LLM output.
-    """
-
     @staticmethod
-    def normalize_text(value: Any) -> str:
-
-        if value is None:
-            return ""
-
-        return str(value).strip()
-
-    @staticmethod
-    def normalize_boolean(value: Any) -> bool:
-
-        if isinstance(value, bool):
-            return value
-
-        if isinstance(value, str):
-
-            value = value.strip().lower()
-
-            return value in {
-                "true",
-                "yes",
-                "1",
-                "y"
-            }
-
-        return bool(value)
-
-    @staticmethod
-    def normalize_integer(
-        value: Any,
-        minimum: int = 1,
-        maximum: int = 10
-    ) -> int:
-
-        try:
-
-            value = int(value)
-
-        except Exception:
-
-            value = minimum
-
-        value = max(minimum, min(maximum, value))
-
-        return value
-
-    @staticmethod
-    def normalize_trade(value: Any) -> str:
-
-        value = Validator.normalize_text(value).lower()
-
-        if value in VALID_TRADES:
-            return value
-
-        return "none"
-
-    @staticmethod
-    def normalize_service_category(value: Any) -> str:
-
-        value = Validator.normalize_text(value).lower()
-
-        aliases = {
-
-            "service": "repair",
-
-            "repair service": "repair",
-
-            "diagnostic": "repair",
-
-            "diagnosis": "repair",
-
-            "install": "installation",
-
-            "replace": "replacement",
-
-            "maintenance visit": "maintenance",
-
-            "tune up": "tune-up",
-
-            "tuneup": "tune-up",
-
-            "air quality": "iaq",
-
-            "indoor air quality": "iaq",
-
-            "waterheater": "water heater",
-
-            "drain cleaning": "drain"
-
-        }
-
-        value = aliases.get(value, value)
-
-        if value in VALID_SERVICE_CATEGORIES:
-            return value
-
-        return "none"
-
-    @staticmethod
-    def normalize_urgency(value: Any) -> str:
-
-        value = Validator.normalize_text(value).lower()
-
-        aliases = {
-
-            "urgent": "same_day",
-
-            "today": "same_day",
-
-            "immediate": "emergency",
-
-            "asap": "same_day",
-
-            "normal": "routine"
-
-        }
-
-        value = aliases.get(value, value)
-
-        if value in VALID_URGENCY:
-            return value
-
-        return "none"
-
-    @staticmethod
-    def normalize_appointment(value: Any) -> str:
-
-        value = Validator.normalize_text(value).lower()
-
-        aliases = {
-
-            "booked": "scheduled",
-
-            "booking": "requested",
-
-            "appointment requested": "requested",
-
-            "appointment scheduled": "scheduled",
-
-            "not booked": "not_scheduled",
-
-            "none": "not_scheduled"
-
-        }
-
-        value = aliases.get(value, value)
-
-        if value in VALID_APPOINTMENT_STATUS:
-            return value
-
-        return "not_scheduled"
-
-    @staticmethod
-    def normalize_confidence(value: Any) -> str:
-
-        value = Validator.normalize_text(value).lower()
-
-        if value in VALID_CONFIDENCE:
-            return value
-
-        return "low"
-
-    @staticmethod
-    def normalize_evidence(value: Any) -> List[str]:
-
-        if value is None:
-            return []
-
-        if isinstance(value, list):
-
-            return [
-                str(x).strip()
-                for x in value
-                if str(x).strip()
-            ]
-
-        if isinstance(value, str):
-
-            value = value.strip()
-
-            if value:
-
-                return [value]
-
-        return []
-
-    @staticmethod
-    def validate(result: Dict[str, Any]) -> Dict[str, Any]:
-
-        output = default_response()
-
-        # Preserve the model's explicit opportunity classification.
-        raw_revenue = result.get("revenue_opportunity")
-        if isinstance(raw_revenue, bool):
-            output["revenue_opportunity"] = raw_revenue
-        elif isinstance(raw_revenue, str) and raw_revenue.strip().lower() in {"true", "false"}:
-            output["revenue_opportunity"] = raw_revenue.strip().lower() == "true"
-        else:
-            raise ValueError("Missing/invalid revenue_opportunity decision in model output")
-
-        output["core_intent"] = Validator.normalize_text(
-            result.get("core_intent")
-        )
-
-        output["customer_problem"] = Validator.normalize_text(
-            result.get("customer_problem")
-        )
-
-        output["customer_goal"] = Validator.normalize_text(
-            result.get("customer_goal")
-        )
-
-        output["requested_service"] = Validator.normalize_text(
-            result.get("requested_service")
-        )
-
-        output["trade"] = Validator.normalize_trade(
-            result.get("trade")
-        )
-
-        output["service_category"] = Validator.normalize_service_category(
-            result.get("service_category")
-        )
-
-        output["urgency"] = Validator.normalize_urgency(
-            result.get("urgency")
-        )
-
-        output["appointment_status"] = Validator.normalize_appointment(
-            result.get("appointment_status")
-        )
-
-        output["pricing_discussed"] = Validator.normalize_boolean(
-            result.get("pricing_discussed")
-        )
-
-        output["intent_strength"] = Validator.normalize_integer(
-            result.get("intent_strength"),
-            minimum=1,
-            maximum=10
-        )
-
-        output["confidence"] = Validator.normalize_confidence(
-            result.get("confidence")
-        )
-
-        output["business_summary"] = Validator.normalize_text(
-            result.get("business_summary")
-        )
-
-        output["business_reason"] = Validator.normalize_text(
-            result.get("business_reason")
-        )
-
-        output["evidence"] = Validator.normalize_evidence(
-            result.get("evidence")
-        )
-
-        return output
-# ==============================================================================
-# Business Rules
-# ==============================================================================
-
-class BusinessRules:
-    """
-    Applies business logic after validation.
-    """
-
-    @staticmethod
-    def compute_revenue_opportunity(result: Dict[str, Any]) -> bool:
-        # Use the transcript-based model decision. Do not infer revenue from
-        # trade, requested_service, appointment status or intent strength.
-        return result["revenue_opportunity"]
-
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def compute_confidence_score(result: Dict[str, Any]) -> int:
-
-        score = 0
-
-        if result["core_intent"]:
-            score += 15
-
-        if result["customer_problem"]:
-            score += 15
-
-        if result["customer_goal"]:
-            score += 10
-
-        if result["requested_service"]:
-            score += 15
-
-        if result["trade"] != "none":
-            score += 10
-
-        if result["service_category"] != "none":
-            score += 10
-
-        if result["appointment_status"] in {
-            "requested",
-            "scheduled",
-            "transferred"
-        }:
-            score += 10
-
-        if result["pricing_discussed"]:
-            score += 5
-
-        if result["evidence"]:
-            score += 10
-
-        score += result["intent_strength"]
-
-        return min(score, 100)
-
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def compute_confidence(score: int) -> str:
-
-        if score >= 80:
-            return "high"
-
-        if score >= 55:
-            return "medium"
-
-        return "low"
-
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def generate_business_summary(result: Dict[str, Any]) -> str:
-
-        if result["business_summary"]:
-            return result["business_summary"]
-
-        summary = []
-
-        if result["customer_problem"]:
-            summary.append(result["customer_problem"])
-
-        if result["requested_service"]:
-            summary.append(
-                f"Requested {result['requested_service']}"
-            )
-
-        elif result["service_category"] != "none":
-            summary.append(
-                f"Requested {result['service_category']} service"
-            )
-
-        if result["appointment_status"] in {
-            "requested",
-            "scheduled"
-        }:
-            summary.append("Appointment requested")
-
-        return ". ".join(summary)
-
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def generate_business_reason(result: Dict[str, Any]) -> str:
-
-        if result["business_reason"]:
-            return result["business_reason"]
-
-        if result["revenue_opportunity"]:
-
-            reasons = []
-
-            if result["requested_service"]:
-                reasons.append(
-                    "Customer explicitly requested service."
-                )
-
-            if result["trade"] != "none":
-                reasons.append(
-                    f"Trade identified as {result['trade']}."
-                )
-
-            if result["service_category"] != "none":
-                reasons.append(
-                    f"Service category is {result['service_category']}."
-                )
-
-            if result["appointment_status"] in {
-                "requested",
-                "scheduled",
-                "transferred"
-            }:
-                reasons.append(
-                    "Customer attempted to schedule an appointment."
-                )
-
-            return " ".join(reasons)
-
-        return (
-            "Transcript does not contain sufficient evidence "
-            "of a customer revenue opportunity."
-        )
-
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def apply(result: Dict[str, Any]) -> Dict[str, Any]:
-
-        result["revenue_opportunity"] = (
-            BusinessRules.compute_revenue_opportunity(result)
-        )
-
-        result["confidence_score"] = (
-            BusinessRules.compute_confidence_score(result)
-        )
-
-        result["confidence"] = (
-            BusinessRules.compute_confidence(
-                result["confidence_score"]
-            )
-        )
-
-        result["business_summary"] = (
-            BusinessRules.generate_business_summary(result)
-        )
-
-        result["business_reason"] = (
-            BusinessRules.generate_business_reason(result)
-        )
-
+    def validate(raw:Dict[str,Any], transcript:str):
+        if not isinstance(raw,dict):
+            raise DetectorError('Model output must be a JSON object')
+        missing = set(DEFAULTS)-set(raw)
+        if missing:
+            raise DetectorError('Missing required keys: '+', '.join(sorted(missing)))
+        result={k:raw[k] for k in DEFAULTS}
+        for key,allowed in ENUMS.items():
+            if not isinstance(result[key],str) or result[key] not in allowed:
+                raise DetectorError(f'Invalid {key}: {result[key]!r}')
+        for key in ('agent_offered_booking','revenue_opportunity'):
+            if type(result[key]) is not bool:
+                raise DetectorError(f'{key} must be boolean')
+        if type(result['intent_strength']) is not int or not 1<=result['intent_strength']<=5:
+            raise DetectorError('intent_strength must be integer 1-5')
+        if result['refusal_paraphrase'] is not None and not isinstance(result['refusal_paraphrase'],str):
+            raise DetectorError('refusal_paraphrase must be text or null')
+        evidence=result['evidence']
+        if not isinstance(evidence,dict):
+            raise DetectorError('evidence must be a field-to-quote object')
+        repaired={}
+        for field,quote in evidence.items():
+            if field not in DEFAULTS or field=='evidence' or not isinstance(quote,str) or not quote.strip():
+                continue
+            quote=quote.strip()
+            if quote in transcript:
+                repaired[field]=quote
+                continue
+            # Recover whitespace-only formatting changes while preserving exact original substring.
+            pattern=r'\s+'.join(re.escape(part) for part in quote.split())
+            match=re.search(pattern,transcript)
+            if match:
+                repaired[field]=match.group(0)
+            else:
+                logger.warning('Dropping non-verbatim evidence for field %s',field)
+        result['evidence']=repaired
+        summary=result['summary']
+        if not isinstance(summary,str) or not summary.strip():
+            raise DetectorError('Missing summary')
+        sentences=re.split(r'(?<=[.!?])\s+',summary.strip())
+        if len(sentences)!=2 or not all(s.strip().endswith(('.', '!', '?')) for s in sentences):
+            raise DetectorError('Summary must contain exactly two sentences')
         return result
-    
-# ==============================================================================
-# Revenue Opportunity Analyzer
-# ==============================================================================
 
 class RevenueOpportunityAnalyzer:
-    """
-    Main detector pipeline.
+    def __init__(self,llm,max_attempts=2):
+        self.llm=llm
+        self.max_attempts=max(1,int(max_attempts))
 
-    Pipeline
-    --------
-    Transcript
-        ↓
-    PromptManager
-        ↓
-    Claude
-        ↓
-    JSON Parser
-        ↓
-    Validator
-        ↓
-    Business Rules
-        ↓
-    Final Output
-    """
+    def analyze(self,transcript:str)->Dict[str,Any]:
+        transcript='' if transcript is None else str(transcript).strip()
+        if not transcript or transcript.lower() in {'nan','null','none'}:
+            raise DetectorError('Empty transcript')
+        system=PromptManager.system_prompt()
+        user=PromptManager.user_prompt(transcript)
+        last_error=None
+        for attempt in range(self.max_attempts):
+            try:
+                response=self.llm.generate(system_prompt=system,user_prompt=user,temperature=0.0,max_tokens=2000)
+                return Validator.validate(JsonParser.parse(response),transcript)
+            except (DetectorError,ValueError,TypeError) as exc:
+                last_error=exc
+                logger.warning('Detector attempt %s/%s failed: %s',attempt+1,self.max_attempts,exc)
+                user=PromptManager.user_prompt(transcript)+('\nPrevious response failed validation: '
+                      +str(exc)+'\nRegenerate a complete, valid JSON object. Copy evidence quotes verbatim.')
+        raise DetectorError(f'Classification failed after {self.max_attempts} attempts: {last_error}')
 
-    def __init__(self, llm: LLMClient):
-
-        self.llm = llm
-
-    # ------------------------------------------------------------------
-
-    def analyze(
-        self,
-        transcript: str
-    ) -> Dict[str, Any]:
-
-        logger.info("=" * 80)
-        logger.info("Revenue Opportunity Analysis Started")
-        logger.info("=" * 80)
-
-        if transcript is None:
-
-            result = default_response()
-
-            result["business_reason"] = "Transcript is None."
-
-            return result
-
-        transcript = str(transcript).strip()
-
-        if transcript.lower() in {"nan", "none", "null"}:
-            transcript = ""
-
-        if not transcript:
-
-            result = default_response()
-
-            result["business_reason"] = "Transcript is empty."
-
-            return result
-
-        try:
-
-            logger.info("Generating LLM response...")
-
-            response = self.llm.generate(
-
-                system_prompt=PromptManager.system_prompt(),
-
-                user_prompt=PromptManager.user_prompt(transcript),
-
-                temperature=0.0,
-
-                max_tokens=1500
-
-            )
-
-            logger.info("LLM response received.")
-
-        except Exception as e:
-
-            logger.exception(e)
-
-            result = default_response()
-
-            result["business_reason"] = (
-                f"PROCESSING_ERROR: LLM inference failed ({type(e).__name__})."
-            )
-
-            return result
-
-        # --------------------------------------------------------------
-        # JSON Parsing
-        # --------------------------------------------------------------
-
-        logger.info("Parsing JSON response...")
-
-        try:
-            parsed = JsonParser.parse(response)
-        except (ValueError, TypeError) as exc:
-            result = default_response()
-            result["business_reason"] = f"PROCESSING_ERROR: Model returned invalid JSON ({type(exc).__name__})."
-            return result
-
-        # --------------------------------------------------------------
-        # Validation
-        # --------------------------------------------------------------
-
-        logger.info("Validating extracted fields...")
-
-        try:
-            validated = Validator.validate(parsed)
-        except (ValueError, TypeError) as exc:
-            result = default_response()
-            result["business_reason"] = f"PROCESSING_ERROR: Missing or invalid model classification ({type(exc).__name__})."
-            return result
-
-        # --------------------------------------------------------------
-        # Business Rules
-        # --------------------------------------------------------------
-
-        logger.info("Applying business rules...")
-
-        final_output = BusinessRules.apply(validated)
-
-        logger.info("=" * 80)
-        logger.info("Revenue Opportunity Analysis Completed")
-        logger.info("=" * 80)
-
-        return final_output
-
-    # ------------------------------------------------------------------
-
-    def __call__(
-        self,
-        transcript: str
-    ) -> Dict[str, Any]:
-
-        return self.analyze(transcript)
-    
-    # def create_detector(llm: LLMClient) -> RevenueOpportunityAnalyzer:
-    #     """
-    #     Factory method for creating the detector.
-    #     """
-
-    #     return RevenueOpportunityAnalyzer(llm)
+    __call__=analyze
