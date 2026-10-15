@@ -88,6 +88,20 @@ def _json_safe(value):
     return value
 
 
+# Fixed output schema: IDs, transcript, all 16 detector KPIs, then diagnostics.
+KPI_COLUMNS = [
+    "core_intent", "customer_problem", "customer_goal", "requested_service",
+    "trade", "service_category", "urgency", "appointment_status",
+    "pricing_discussed", "revenue_opportunity", "intent_strength",
+    "confidence", "confidence_score", "evidence", "business_summary",
+    "business_reason",
+]
+OUTPUT_COLUMNS = [
+    "audio_id", "call_id", "transcription_text", *KPI_COLUMNS,
+    "row_number", "semantic_evidence", "status", "error_message", "evidence_error",
+]
+
+
 def run_batch_analysis(dataframe: pd.DataFrame,
                        output_json_path: str = "output_results.json",
                        output_excel_path: str = "output_results.xlsx",
@@ -111,7 +125,7 @@ def run_batch_analysis(dataframe: pd.DataFrame,
                 "audio_id": audio_id,
                 "call_id": call_id,
                 "transcription_text": "" if _blank(raw) else str(raw),
-                **{key: None for key in DEFAULT_RESPONSE},
+                **{key: None for key in KPI_COLUMNS},
                 "semantic_evidence": [],
                 "status": None,
                 "error_message": None,
@@ -126,7 +140,7 @@ def run_batch_analysis(dataframe: pd.DataFrame,
                 cleaned = cleaner.clean(str(raw))
                 if not isinstance(cleaned, str) or not cleaned.strip():
                     raise ValueError("Transcript empty after cleaning")
-                base["transcription_text"] = cleaned
+                # Keep the original transcript in the exported transcription_text column.
                 intent = detector.analyze(cleaned)
                 if not isinstance(intent, dict):
                     raise TypeError("Detector did not return a dictionary")
@@ -134,7 +148,7 @@ def run_batch_analysis(dataframe: pd.DataFrame,
                 if reason.startswith("PROCESSING_ERROR:"):
                     raise ValueError(reason)
                 # Preserve the complete original KPI dictionary.
-                for key in DEFAULT_RESPONSE:
+                for key in KPI_COLUMNS:
                     base[key] = intent.get(key)
                 base["status"] = "Success"
                 # Evidence failure must not discard successful intent analysis.
@@ -153,7 +167,7 @@ def run_batch_analysis(dataframe: pd.DataFrame,
                 print(f"Call {call_id} failed: {type(exc).__name__}: {exc}")
             results.append(base)
 
-    output = pd.DataFrame(results)
+    output = pd.DataFrame(results, columns=OUTPUT_COLUMNS)
     for path in (output_json_path, output_excel_path):
         directory = os.path.dirname(path)
         if directory:
