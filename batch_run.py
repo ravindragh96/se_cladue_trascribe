@@ -1,443 +1,180 @@
-import sys
-import os
+"""Databricks batch runner; preserves all original detector KPIs.
+
+Set FILE_PATH below (or define file_path in the notebook before executing).
+"""
 import io
 import json
-import pandas as pd
+import os
+import sys
 
+import pandas as pd
 from tqdm.auto import tqdm
 
-# ==========================================================
-# 1. SETUP PROJECT PATH
-# ==========================================================
-
 current_dir = os.getcwd()
-
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-# ==========================================================
-# 2. IMPORT PIPELINE COMPONENTS
-# ==========================================================
-
 from models.model_registry import ModelRegistry
-from modules.detector import RevenueOpportunityAnalyzer
+from modules.detector import RevenueOpportunityAnalyzer, DEFAULT_RESPONSE
 from modules.evidence import EvidenceExtractor
 from modules.cleaner import TranscriptCleaner
 from modules.llm_client import LLMClient
 
-# ==========================================================
-# 3. INITIALIZE MODELS
-# ==========================================================
-
-print("Initializing AI models...")
+FILE_PATH = globals().get("file_path", "SE_sample_trans.xlsx")
 
 registry = ModelRegistry()
-
 llm = LLMClient(registry)
-
 detector = RevenueOpportunityAnalyzer(llm)
 cleaner = TranscriptCleaner()
 
-evidence_extractor = EvidenceExtractor(registry)
+# Evidence is supplementary. If embedding model loading fails, keep classifying.
+try:
+    evidence_extractor = EvidenceExtractor(registry)
+    evidence_init_error = None
+except Exception as exc:
+    evidence_extractor = None
+    evidence_init_error = f"{type(exc).__name__}: {exc}"
+    print(f"Warning: semantic evidence disabled: {evidence_init_error}")
 
-print("Pipeline initialized successfully.")
-
-# ==========================================================
-# 4. LOAD EXCEL DATA
-# ==========================================================
-
-# file_path = "SE_sample_trans.xlsx"
-
-if os.path.exists(file_path):
-    df = pd.read_excel(file_path)
-
+if os.path.exists(FILE_PATH):
+    df = pd.read_excel(FILE_PATH)
 else:
-    binary_df = (
-        spark.read
-        .format("binaryFile")
-        .load(file_path)
-    )
-
+    # Databricks binaryFile fallback for paths accessible through Spark.
+    binary_df = spark.read.format("binaryFile").load(FILE_PATH)
     content = binary_df.collect()[0]["content"]
     df = pd.read_excel(io.BytesIO(content))
 
-print(f"Loaded {len(df)} records.")
-
-# ==========================================================
-# 5. STANDARDIZE INPUT COLUMNS
-# ==========================================================
-
-# Preserve audio ID
-if "audio_id" not in df.columns:
-    if "audio_file" in df.columns:
-        df["audio_id"] = df["audio_file"].astype(str)
-    else:
-        df["audio_id"] = [
-            f"audio_{i}" for i in range(len(df))
-        ]
-
-# Preserve call ID
-if "call_id" not in df.columns:
-    df["call_id"] = df["audio_id"].astype(str)
-
-# Find transcript column
+# Normalize column names for matching only; preserve original data.
+normalized_names = {str(col).strip().lower(): col for col in df.columns}
 transcript_col = next(
-    (
-        col for col in df.columns
-        if any(
-            key in str(col).lower()
-            for key in ["transcript", "text"]
-        )
-    ),
-    None
+    (normalized_names[key] for key in ("transcription_text", "transcript", "transcription", "text")
+     if key in normalized_names),
+    None,
 )
-
 if transcript_col is None:
-    raise ValueError(
-        "No transcript column found in Excel."
+    transcript_col = next(
+        (col for col in df.columns if "transcript" in str(col).lower()), None
     )
+if transcript_col is None:
+    raise ValueError(f"No transcript column found. Columns: {list(df.columns)}")
 
-if transcript_col != "transcription_text":
-    df["transcription_text"] = df[transcript_col]
-
-print("Input columns standardized.")
-
-# ==========================================================
-# 6. HELPER FUNCTIONS
-# ==========================================================
-
-def get_field(data, *keys, default=None):
-    """
-    Return the first non-null field from a dictionary.
-    """
-    for key in keys:
-        value = data.get(key)
-
-        if value is not None:
-            return value
-
-    return default
+df["transcription_text"] = df[transcript_col]
+if "audio_id" not in df.columns:
+    df["audio_id"] = df["audio_file"] if "audio_file" in df.columns else [
+        f"audio_{i}" for i in range(len(df))
+    ]
+if "call_id" not in df.columns:
+    df["call_id"] = df["audio_id"]
 
 
-def normalize_evidence(evidence):
-    """
-    Convert evidence extractor output into a list.
-    """
-    if evidence is None:
-        return []
-
-    if isinstance(evidence, list):
-        return evidence
-
-    if isinstance(evidence, str):
-        return [evidence] if evidence.strip() else []
-
-    if isinstance(evidence, dict):
-        return [evidence]
-
-    return [str(evidence)]
+def _blank(value):
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip() or value.strip().lower() in {"nan", "none", "null"}
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
 
 
-def normalize_booked_status(intent):
-    """
-    Preserve explicit booked_on_call when supplied.
-
-    Do not infer a booking from a generic appointment
-    status because it may refer to an existing booking.
-    """
-    value = intent.get("booked_on_call")
-
-    if isinstance(value, bool):
-        return value
-
-    return None
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    return value
 
 
-# ==========================================================
-# 7. BATCH PROCESSING
-# ==========================================================
-
-def run_batch_analysis(
-    dataframe: pd.DataFrame,
-    output_json_path: str = "output_results.json",
-    output_excel_path: str = "output_results.xlsx",
-    batch_size: int = 10,
-    top_k: int = 4
-):
-
+def run_batch_analysis(dataframe: pd.DataFrame,
+                       output_json_path: str = "output_results.json",
+                       output_excel_path: str = "output_results.xlsx",
+                       batch_size: int = 10,
+                       top_k: int = 4) -> pd.DataFrame:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     results = []
+    print(f"Processing {len(dataframe)} transcripts...")
 
-    total = len(dataframe)
-
-    print(f"Processing {total} transcripts...")
-
-    for start in range(0, total, batch_size):
-
-        end = min(start + batch_size, total)
-
-        batch = dataframe.iloc[start:end]
-
-        print(
-            f"\nBatch {start // batch_size + 1}"
-            f" ({start} to {end - 1})"
-        )
-
-        for index, row in tqdm(
-            batch.iterrows(),
-            total=len(batch)
-        ):
-
-            audio_id = str(
-                row.get("audio_id", f"audio_{index}")
-            )
-
-            call_id = str(
-                row.get("call_id", audio_id)
-            )
-
-            raw_transcript = row.get(
-                "transcription_text", ""
-            )
-
-            # Handle missing transcript
-            if (
-                not isinstance(raw_transcript, str)
-                or not raw_transcript.strip()
-            ):
-                results.append({
-                    "audio_id": audio_id,
-                    "call_id": call_id,
-                    "transcription_text": "",
-                    "trade": None,
-                    "revenue_opportunity": None,
-                    "booked_on_call": None,
-                    "call_reason": None,
-                    "customer_intent": None,
-                    "outcome": None,
-                    "next_step": None,
-                    "evidence": [],
-                    "status": "Skipped"
-                })
+    for start in range(0, len(dataframe), batch_size):
+        batch = dataframe.iloc[start:start + batch_size]
+        print(f"Batch {start // batch_size + 1}: rows {start}–{start + len(batch) - 1}")
+        for offset, (_, row) in enumerate(tqdm(batch.iterrows(), total=len(batch))):
+            row_number = start + offset
+            audio_id = str(row.get("audio_id", f"audio_{row_number}"))
+            call_id = str(row.get("call_id", audio_id))
+            raw = row.get("transcription_text")
+            base = {
+                "row_number": row_number,
+                "audio_id": audio_id,
+                "call_id": call_id,
+                "transcription_text": "" if _blank(raw) else str(raw),
+                **{key: None for key in DEFAULT_RESPONSE},
+                "semantic_evidence": [],
+                "status": None,
+                "error_message": None,
+                "evidence_error": evidence_init_error,
+            }
+            if _blank(raw):
+                base.update(status="Skipped", error_message="Empty/missing transcript")
+                results.append(base)
                 continue
 
-            cleaned_text = ""
-
             try:
+                cleaned = cleaner.clean(str(raw))
+                if not isinstance(cleaned, str) or not cleaned.strip():
+                    raise ValueError("Transcript empty after cleaning")
+                base["transcription_text"] = cleaned
+                intent = detector.analyze(cleaned)
+                if not isinstance(intent, dict):
+                    raise TypeError("Detector did not return a dictionary")
+                reason = str(intent.get("business_reason") or "")
+                if reason.startswith("PROCESSING_ERROR:"):
+                    raise ValueError(reason)
+                # Preserve the complete original KPI dictionary.
+                for key in DEFAULT_RESPONSE:
+                    base[key] = intent.get(key)
+                base["status"] = "Success"
+                # Evidence failure must not discard successful intent analysis.
+                if evidence_extractor is not None:
+                    try:
+                        base["semantic_evidence"] = evidence_extractor.extract(
+                            cleaned, intent, top_k=top_k
+                        )
+                    except Exception as evidence_exc:
+                        base["evidence_error"] = (
+                            f"{type(evidence_exc).__name__}: {evidence_exc}"
+                        )
+            except Exception as exc:
+                base["status"] = "Failed"
+                base["error_message"] = f"{type(exc).__name__}: {exc}"
+                print(f"Call {call_id} failed: {type(exc).__name__}: {exc}")
+            results.append(base)
 
-                # --------------------------------------
-                # STEP 1: CLEAN TRANSCRIPT
-                # --------------------------------------
-
-                cleaned_text = cleaner.clean(
-                    raw_transcript
-                )
-
-                if not cleaned_text.strip():
-                    raise ValueError(
-                        "Transcript empty after cleaning."
-                    )
-
-                # --------------------------------------
-                # STEP 2: BUSINESS INTENT ANALYSIS
-                # --------------------------------------
-
-                intent_results = detector.analyze(
-                    cleaned_text
-                )
-
-                if not isinstance(intent_results, dict):
-                    raise TypeError(
-                        "Detector must return a dictionary."
-                    )
-
-                # --------------------------------------
-                # STEP 3: EXTRACT SEMANTIC EVIDENCE
-                # --------------------------------------
-
-                evidence_results = (
-                    evidence_extractor.extract(
-                        cleaned_text,
-                        intent_results,
-                        top_k=top_k
-                    )
-                )
-
-                evidence = normalize_evidence(
-                    evidence_results
-                )
-
-                # --------------------------------------
-                # STEP 4: BUILD RESULT
-                # --------------------------------------
-
-                result = {
-                    "audio_id": audio_id,
-
-                    "call_id": call_id,
-
-                    "transcription_text": cleaned_text,
-
-                    "trade": get_field(
-                        intent_results,
-                        "trade",
-                        default="none"
-                    ),
-
-                    "revenue_opportunity": get_field(
-                        intent_results,
-                        "revenue_opportunity"
-                    ),
-
-                    "booked_on_call": normalize_booked_status(
-                        intent_results
-                    ),
-
-                    "call_reason": get_field(
-                        intent_results,
-                        "call_reason",
-                        "core_intent"
-                    ),
-
-                    "customer_intent": get_field(
-                        intent_results,
-                        "customer_intent",
-                        "customer_goal"
-                    ),
-
-                    "outcome": get_field(
-                        intent_results,
-                        "outcome"
-                    ),
-
-                    "next_step": get_field(
-                        intent_results,
-                        "next_step"
-                    ),
-
-                    "evidence": evidence,
-
-                    "status": "Success"
-                }
-
-                results.append(result)
-
-            except Exception as e:
-
-                print(
-                    f"Error in Call ID {call_id}: {e}"
-                )
-
-                results.append({
-                    "audio_id": audio_id,
-                    "call_id": call_id,
-                    "transcription_text": cleaned_text,
-                    "trade": None,
-                    "revenue_opportunity": None,
-                    "booked_on_call": None,
-                    "call_reason": None,
-                    "customer_intent": None,
-                    "outcome": None,
-                    "next_step": None,
-                    "evidence": [],
-                    "status": "Failed",
-                    "error_message": str(e)
-                })
-
-    # ======================================================
-    # 8. CREATE FINAL DATAFRAME
-    # ======================================================
-
-    output_columns = [
-        "audio_id",
-        "call_id",
-        "transcription_text",
-        "trade",
-        "revenue_opportunity",
-        "booked_on_call",
-        "call_reason",
-        "customer_intent",
-        "outcome",
-        "next_step",
-        "evidence",
-        "status",
-        "error_message"
-    ]
-
-    results_df = pd.DataFrame(
-        results,
-        columns=output_columns
-    )
-
-    # ======================================================
-    # 9. SAVE JSON
-    # ======================================================
-
-    for output_path in [
-        output_json_path,
-        output_excel_path
-    ]:
-        output_dir = os.path.dirname(output_path)
-
-        if output_dir:
-            os.makedirs(
-                output_dir,
-                exist_ok=True
-            )
-
-    with open(
-        output_json_path,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            results,
-            f,
-            indent=4,
-            ensure_ascii=False,
-            default=str
+    output = pd.DataFrame(results)
+    for path in (output_json_path, output_excel_path):
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+    with open(output_json_path, "w", encoding="utf-8") as handle:
+        json.dump([_json_safe(record) for record in results], handle,
+                  indent=2, ensure_ascii=False, default=str)
+    excel_output = output.copy()
+    for col in ("evidence", "semantic_evidence"):
+        excel_output[col] = excel_output[col].apply(
+            lambda item: json.dumps(item, ensure_ascii=False, default=str)
         )
-
-    # ======================================================
-    # 10. SAVE EXCEL
-    # ======================================================
-
-    excel_df = results_df.copy()
-
-    excel_df["evidence"] = (
-        excel_df["evidence"].apply(
-            lambda x: json.dumps(
-                x,
-                ensure_ascii=False
-            )
-        )
-    )
-
-    excel_df.to_excel(
-        output_excel_path,
-        index=False
-    )
-
-    print("\nBatch processing completed.")
-    print(f"JSON: {output_json_path}")
-    print(f"Excel: {output_excel_path}")
-
-    return results_df
+    excel_output.to_excel(output_excel_path, index=False)
+    print("Batch complete:", output["status"].value_counts(dropna=False).to_dict())
+    print("JSON:", output_json_path)
+    print("Excel:", output_excel_path)
+    return output
 
 
-# ==========================================================
-# 11. EXECUTE PIPELINE
-# ==========================================================
-
-results_df = run_batch_analysis(
-    dataframe=df,
-    output_json_path="output_results.json",
-    output_excel_path="output_results.xlsx",
-    batch_size=10,
-    top_k=4
-)
-
-# ==========================================================
-# 12. DISPLAY RESULTS
-# ==========================================================
-
-display(results_df)
+results_df = run_batch_analysis(df, batch_size=10, top_k=4)
+try:
+    display(results_df)
+except NameError:
+    print(results_df.head())
