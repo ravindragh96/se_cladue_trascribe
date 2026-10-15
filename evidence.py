@@ -87,3 +87,5 @@ class EvidenceExtractor:
 def create_evidence_extractor(registry: ModelRegistry,
                               top_k: int = 5) -> EvidenceExtractor:
     return EvidenceExtractor(registry=registry, top_k=top_k)
+
+
