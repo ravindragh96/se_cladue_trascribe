@@ -1,3 +1,67 @@
+"""Databricks LLM response adapter. No revenue-classification business logic."""
+import logging
+import re
+from typing import Any, Dict, List, Optional
+from models.model_registry import ModelRegistry
+
+logger = logging.getLogger(__name__)
+
+
+class LLMResponseError(RuntimeError):
+    """The model response is empty, malformed, or explicitly truncated."""
+
+
+class LLMClient:
+    def __init__(self, registry: ModelRegistry, endpoint_name: Optional[str] = None):
+        self.registry = registry
+        self.endpoint_name = endpoint_name
+
+    def _build_messages(self, system_prompt: str, user_prompt: str) -> List[Dict[str, str]]:
+        return [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": user_prompt.strip()},
+        ]
+
+    @staticmethod
+    def _get(obj: Any, key: str, default: Any = None) -> Any:
+        return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
+
+    @classmethod
+    def _content_to_text(cls, content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                else:
+                    kind = cls._get(item, "type")
+                    if kind in (None, "text", "output_text"):
+                        value = cls._get(item, "text")
+                        if isinstance(value, str):
+                            parts.append(value)
+                        elif value is not None:
+                            nested = cls._get(value, "value")
+                            if isinstance(nested, str):
+                                parts.append(nested)
+            return "\n".join(parts)
+        return ""
+
+    @classmethod
+    def _extract_text(cls, response: Any) -> str:
+        if isinstance(response, str):
+            return cls._clean_response(response)
+        choices = cls._get(response, "choices")
+        if choices:
+            choice = choices[0]
+            finish = cls._get(choice, "finish_reason")
+            if finish in ("length", "max_tokens"):
+                raise LLMResponseError("Model generation was truncated (finish_reason=length).")
+            message = cls._get(choice, "message")
+            content = cls._get(message, "content") if message is not None else None
             text = cls._content_to_text(content)
             if not text:
                 text = cls._content_to_text(cls._get(choice, "text"))
@@ -38,6 +102,7 @@
             raise LLMResponseError("Model returned empty text after cleanup.")
         logger.info("LLM text extracted successfully; characters=%d", len(text))
         return text
+
 
 
 
