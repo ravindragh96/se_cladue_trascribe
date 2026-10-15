@@ -1,3 +1,47 @@
+            text = cls._content_to_text(content)
+            if not text:
+                text = cls._content_to_text(cls._get(choice, "text"))
+            if text.strip():
+                return cls._clean_response(text)
+        predictions = cls._get(response, "predictions")
+        if predictions:
+            first = predictions[0]
+            if isinstance(first, str):
+                return cls._clean_response(first)
+            for key in ("content", "text", "generated_text"):
+                text = cls._content_to_text(cls._get(first, key))
+                if text.strip():
+                    return cls._clean_response(text)
+        for key in ("content", "text", "generated_text", "output_text"):
+            text = cls._content_to_text(cls._get(response, key))
+            if text.strip():
+                return cls._clean_response(text)
+        raise LLMResponseError("No usable generated text in model response.")
+
+    @staticmethod
+    def _clean_response(text: str) -> str:
+        text = re.sub(r"<think\b[^>]*>.*?</think\s*>", "", text,
+                      flags=re.DOTALL | re.IGNORECASE).strip()
+        match = re.fullmatch(r"```(?:json)?\s*\n?(.*?)\n?```", text,
+                             flags=re.DOTALL | re.IGNORECASE)
+        return match.group(1).strip() if match else text
+
+    def generate(self, system_prompt: str, user_prompt: str,
+                 temperature: float = 0.0, max_tokens: int = 1500) -> str:
+        messages = self._build_messages(system_prompt, user_prompt)
+        response = self.registry.predict_llm(
+            messages=messages, temperature=temperature,
+            max_tokens=max_tokens, endpoint_name=self.endpoint_name,
+        )
+        text = self._extract_text(response)
+        if not text:
+            raise LLMResponseError("Model returned empty text after cleanup.")
+        logger.info("LLM text extracted successfully; characters=%d", len(text))
+        return text
+
+
+
+##########################
 """
 ==============================================================================
 Track A - Service Experts Revenue Opportunity Detection
